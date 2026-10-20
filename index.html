@@ -274,9 +274,9 @@ room.on("broadcast", { event: "pos" }, ({ payload: p }) => {
   if (o) { o.dead = true; o.hp = 0; o.armed = false; }
   const nm = String(p.name || "?").slice(0, 20), by = String(p.by || "someone").slice(0, 20);
   explode(num(p.x, 0, RW), num(p.y, 0, RH), COLORS.includes(p.color) ? p.color : "#fff");
-  addLog("\u2620", nm + " was blown up by " + by, "#aaa");
+  addLog("\u2620", nm + " was killed by " + by, "#aaa");
   shake = Math.max(shake, 4); sfx("boom");
-  if (p.byId === id) { toast("You blew up " + nm, 2500); shake = Math.max(shake, 8); sfx("kill"); hitstop(FREEZE_MS, 0.9); }
+  if (p.byId === id) { toast("You Died " + nm, 2500); shake = Math.max(shake, 8); sfx("kill"); hitstop(FREEZE_MS, 0.9); }
   else hitstop(FREEZE_SOFT_MS, 0.25);
 }).on("broadcast", { event: "dash" }, ({ payload: p }) => {
   const o = p && others.get(p.id);
