@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Hangout</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font: 14px system-ui, sans-serif; color: #eee; }
+  canvas { display: block; touch-action: none; }
+  #top { position: fixed; top: 0; left: 0; right: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 10px; background: rgba(0,0,0,.85); }
+  .sw { width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; box-sizing: border-box; }
+  .sw.on { border-color: #fff; box-shadow: inset 0 0 0 2px #000; }
+  #nm { width: 110px; box-sizing: border-box; padding: 4px 8px; border: 1px solid #444; border-radius: 6px; background: #1a1a1a; color: #fff; font: inherit; outline: none; }
+  #nm:focus { border-color: #fff; }
+  #status { margin-left: auto; font-size: 12px; opacity: .7; }
+  #chat { position: fixed; left: 10px; bottom: 10px; width: min(360px, calc(100% - 20px)); }
+  #log { height: 200px; overflow-y: auto; padding: 6px 8px; background: rgba(0,0,0,.8); border-radius: 8px 8px 0 0; font-size: 13px; }
+  #log div { margin: 2px 0; word-wrap: break-word; }
+  #log b { margin-right: 5px; }
+  #msg { width: 100%; box-sizing: border-box; padding: 9px; border: 0; border-radius: 0 0 8px 8px; background: #222; color: #fff; font: inherit; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="top"><span>Color</span><span id="sws" style="display:flex;gap:4px"></span><span>Name</span><input id="nm" maxlength="20" placeholder="Your name" autocomplete="off"><span id="status">connecting</span></div>
+<div id="chat"><div id="log"></div><input id="msg" maxlength="200" placeholder="Press Enter to chat. Everyone can see it." autocomplete="off"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script>
+// ---- Use the same values as your other Supabase files ----
+const SUPABASE_URL = "PASTE_YOUR_SUPABASE_URL";
+const SUPABASE_KEY = "PASTE_YOUR_ANON_KEY";
+// -----------------------------------------------------------
+
+const RW = 1200, RH = 800, R = 16, SPEED = 260;
+const MAXHP = 100, DMG = 25, BULLET_SPEED = 760, BULLET_LIFE = 1.1, COOLDOWN = 260;
+const RESPAWN_MS = 5000, SHIELD_MS = 1500, GUN_RESPAWN_MS = 10000;
+const COLORS = ["#ff6b6b", "#ffa94d", "#ffd43b", "#69db7c", "#38d9a9", "#ffffff", "#9775fa", "#f783ac"];
+const GUNS = [{ x: 600, y: 210, up: true, at: 0 }, { x: 600, y: 610, up: true, at: 0 }];
+const $ = id => document.getElementById(id);
+const cv = $("cv"), g = cv.getContext("2d"), logEl = $("log"), msgEl = $("msg"), nmEl = $("nm");
+
+let name = "";
+try { name = localStorage.getItem("hg_name") || ""; } catch (e) {}
+if (!name.trim()) name = "Guest" + (100 + Math.floor(Math.random() * 900));
+name = name.trim().slice(0, 20);
+try { localStorage.setItem("hg_name", name); } catch (e) {}
+nmEl.value = name;
+
+const id = Math.random().toString(36).slice(2, 10);
+const me = {
+  x: RW / 2, y: RH / 2, color: COLORS[Math.floor(Math.random() * COLORS.length)], tx: null, ty: null, say: "", until: 0,
+  hp: MAXHP, armed: false, dead: false, aim: 0, shield: 0, respawnAt: 0
+};
+const others = new Map(), keys = new Set();
+const bullets = [], parts = [], puffs = [], mouse = { x: RW / 2 + 100, y: RH / 2 };
+let W, H, sc = 1, ox = 0, oy = 0, lastSend = 0, moved = false, online = false;
+let lastShot = 0, shots = 0, lastAim = 0, hintUntil = 0;
+
+function setStatus(s) { $("status").textContent = s; }
+if (SUPABASE_URL.startsWith("PASTE")) { setStatus("add your Supabase URL and key at the top of the file"); throw new Error("Supabase not configured"); }
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const room = sb.channel("hangout", { config: { broadcast: { self: false } } });
+
+const num = (v, lo, hi) => Math.min(hi, Math.max(lo, +v || 0));
+function send(event, payload) { if (online) room.send({ type: "broadcast", event, payload }); }
+function sendPos() {
+  if (!online) return;
+  send("pos", { id, name, color: me.color, x: me.x, y: me.y, hp: Math.round(me.hp), armed: me.armed, aim: +me.aim.toFixed(2), dead: me.dead });
+  lastSend = Date.now(); lastAim = me.aim;
+}
+
+// ---- particles ----
+function explode(x, y, c) {
+  for (let i = 0; i < 44; i++) {
+    const a = Math.random() * 6.283, s = 60 + Math.random() * 300, life = 0.6 + Math.random() * 0.9;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, r: 2 + Math.random() * 4, c });
+  }
+  if (parts.length > 600) parts.splice(0, parts.length - 600);
+}
+function sparks(x, y, c, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.283, s = 40 + Math.random() * 120, life = 0.25 + Math.random() * 0.25;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, r: 1.5 + Math.random() * 1.5, c });
+  }
+}
+
+// ---- run personality: smoke puffs + squash & stretch ----
+function puff(x, y, dx, dy) {
+  const life = 0.35 + Math.random() * 0.25;
+  puffs.push({
+    x: x - dx * R * 0.9 + (Math.random() - 0.5) * 6, y: y - dy * R * 0.9 + (Math.random() - 0.5) * 6 + 4,
+    vx: -dx * 25 + (Math.random() - 0.5) * 30, vy: -dy * 25 + (Math.random() - 0.5) * 30 - 8,
+    life, max: life, r: 3 + Math.random() * 3
+  });
+  if (puffs.length > 300) puffs.shift();
+}
+// works for you and for everyone else: measures how fast the circle is moving,
+// then springs the stretch toward it so it overshoots (jelly wobble) when you stop
+function animate(o, dt) {
+  if (dt < 0.001) return;
+  if (o.px === undefined || o.dead) { o.px = o.x; o.py = o.y; o.s = 0; o.sv = 0; o.run = 0; return; }
+  let vx = (o.x - o.px) / dt, vy = (o.y - o.py) / dt, sp = Math.hypot(vx, vy);
+  o.px = o.x; o.py = o.y;
+  if (sp > SPEED * 3) { vx = vy = sp = 0; }            // teleport (respawn), not running
+  if (sp > 20) o.ang = Math.atan2(vy, vx);
+  const target = Math.min(0.32, sp / SPEED * 0.32);
+  o.sv = (o.sv || 0) + (220 * (target - (o.s || 0)) - 18 * (o.sv || 0)) * dt;
+  o.s = Math.max(-0.35, Math.min(0.5, (o.s || 0) + o.sv * dt));
+  o.ph = (o.ph || 0) + sp * dt * 0.06;                  // step cycle advances with distance run
+  o.run = sp;
+  o.pt = (o.pt || 0) + dt;
+  if (sp > 80 && o.pt > 0.05) { o.pt = 0; puff(o.x, o.y, vx / sp, vy / sp); }
+}
+
+// ---- bullets ----
+function addBullet(owner, bid, x, y, a, c) {
+  bullets.push({ id: bid, owner, x, y, vx: Math.cos(a) * BULLET_SPEED, vy: Math.sin(a) * BULLET_SPEED, life: BULLET_LIFE, c });
+  if (bullets.length > 300) bullets.shift();
+}
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+  let t = l2 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+function fire() {
+  const now = Date.now();
+  if (!me.armed || me.dead || now - lastShot < COOLDOWN) return;
+  lastShot = now;
+  const a = me.aim, sx = me.x + Math.cos(a) * (R + 14), sy = me.y + Math.sin(a) * (R + 14);
+  const bid = id + ":" + (shots++);
+  addBullet(id, bid, sx, sy, a, me.color);
+  send("shot", { id, b: bid, x: sx, y: sy, a, c: me.color });
+}
+// you are the one who decides if you got hit (no server), then tell everyone
+function hurt(b) {
+  me.hp -= DMG;
+  sparks(b.x, b.y, me.color, 6);
+  send("hit", { id, b: b.id, x: b.x, y: b.y, hp: Math.max(0, me.hp) });
+  if (me.hp <= 0) die(b.owner); else sendPos();
+}
+function die(by) {
+  me.hp = 0; me.dead = true; me.armed = false; me.tx = me.ty = null; me.respawnAt = Date.now() + RESPAWN_MS;
+  const o = others.get(by), killer = o && o.name ? o.name : "someone";
+  explode(me.x, me.y, me.color);
+  addLog("\u2620", name + " was blown up by " + killer, "#aaa");
+  send("die", { id, name, color: me.color, x: me.x, y: me.y, by: killer });
+  sendPos();
+}
+function respawn() {
+  me.dead = false; me.hp = MAXHP; me.armed = false;
+  me.x = 60 + Math.random() * (RW - 120); me.y = 90 + Math.random() * (RH - 180);
+  me.shield = Date.now() + SHIELD_MS;
+  sendPos();
+}
+
+room.on("broadcast", { event: "pos" }, ({ payload: p }) => {
+  if (!p || typeof p.id !== "string") return;
+  const nx = num(p.x, 0, RW), ny = num(p.y, 0, RH);
+  let o = others.get(p.id);
+  if (!o) { o = { x: nx, y: ny, say: "", until: 0, aim: 0, dead: false }; others.set(p.id, o); }
+  if (o.dead && !p.dead) { o.x = nx; o.y = ny; }
+  o.name = String(p.name || "?").slice(0, 20);
+  o.color = COLORS.includes(p.color) ? p.color : COLORS[0];
+  o.tx = nx; o.ty = ny; o.seen = Date.now();
+  o.hp = p.hp === undefined ? MAXHP : num(p.hp, 0, MAXHP);
+  o.armed = !!p.armed; o.dead = !!p.dead;
+  if (typeof p.aim === "number" && isFinite(p.aim)) o.aim = p.aim;
+}).on("broadcast", { event: "chat" }, ({ payload: p }) => {
+  if (!p || typeof p.text !== "string") return;
+  const text = p.text.slice(0, 200), nm = String(p.name || "?").slice(0, 20);
+  const o = others.get(p.id);
+  if (o) { o.say = text; o.until = Date.now() + 6000; }
+  addLog(nm, text, o ? o.color : "#ccc");
+}).on("broadcast", { event: "shot" }, ({ payload: p }) => {
+  if (!p || typeof p.id !== "string" || typeof p.b !== "string") return;
+  const a = +p.a; if (!isFinite(a)) return;
+  addBullet(p.id, p.b, num(p.x, 0, RW), num(p.y, 0, RH), a, COLORS.includes(p.c) ? p.c : "#fff");
+  const o = others.get(p.id);
+  if (o) { o.aim = a; o.armed = true; }
+}).on("broadcast", { event: "hit" }, ({ payload: p }) => {
+  if (!p || typeof p.b !== "string") return;
+  const i = bullets.findIndex(b => b.id === p.b);
+  if (i >= 0) bullets.splice(i, 1);
+  const v = others.get(p.id);
+  sparks(num(p.x, 0, RW), num(p.y, 0, RH), v ? v.color : "#fff", 6);
+  if (v) v.hp = num(p.hp, 0, MAXHP);
+}).on("broadcast", { event: "die" }, ({ payload: p }) => {
+  if (!p || typeof p.id !== "string") return;
+  const o = others.get(p.id);
+  if (o) { o.dead = true; o.hp = 0; o.armed = false; }
+  const nm = String(p.name || "?").slice(0, 20), by = String(p.by || "someone").slice(0, 20);
+  explode(num(p.x, 0, RW), num(p.y, 0, RH), COLORS.includes(p.color) ? p.color : "#fff");
+  addLog("\u2620", nm + " was blown up by " + by, "#aaa");
+}).on("broadcast", { event: "grab" }, ({ payload: p }) => {
+  if (!p) return;
+  const s = GUNS[p.s | 0];
+  if (s) { s.up = false; s.at = Date.now(); }
+  const o = others.get(p.id);
+  if (o) o.armed = true;
+}).subscribe(s => {
+  online = s === "SUBSCRIBED";
+  setStatus(s === "SUBSCRIBED" ? "online" : s === "TIMED_OUT" || s === "CHANNEL_ERROR" ? "connection lost" : "connecting");
+  if (s === "SUBSCRIBED") sendPos();
+});
+setInterval(sendPos, 1500);
+
+function addLog(nm, text, color) {
+  const d = document.createElement("div"), b = document.createElement("b"), t = document.createElement("span");
+  b.textContent = nm; b.style.color = color; t.textContent = text;
+  d.append(b, t); logEl.appendChild(d);
+  while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ---- change name ----
+function applyName() {
+  const v = nmEl.value.trim().slice(0, 20);
+  if (!v) { nmEl.value = name; return; }
+  nmEl.value = v;
+  if (v === name) return;
+  name = v;
+  try { localStorage.setItem("hg_name", name); } catch (e) {}
+  sendPos();
+}
+nmEl.onkeydown = e => {
+  e.stopPropagation();
+  if (e.key === "Escape") nmEl.value = name;
+  if (e.key === "Enter" || e.key === "Escape") nmEl.blur();
+};
+nmEl.onblur = applyName;
+
+// ---- input ----
+msgEl.onkeydown = e => {
+  e.stopPropagation();
+  if (e.key === "Escape") msgEl.blur();
+  if (e.key === "Enter") {
+    const text = msgEl.value.trim(); msgEl.value = "";
+    if (!text) return;
+    me.say = text; me.until = Date.now() + 6000;
+    addLog(name, text, me.color);
+    send("chat", { id, name, text });
+  }
+};
+addEventListener("keydown", e => {
+  if (document.activeElement === msgEl || document.activeElement === nmEl) return;
+  if (e.key === "Enter") { msgEl.focus(); e.preventDefault(); return; }
+  if (e.key === " ") { e.preventDefault(); fire(); return; }
+  keys.add(e.key.toLowerCase()); me.tx = null;
+});
+addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
+addEventListener("pointermove", e => { mouse.x = (e.clientX - ox) / sc; mouse.y = (e.clientY - oy) / sc; });
+cv.oncontextmenu = e => e.preventDefault();
+cv.onpointerdown = e => {
+  const wx = (e.clientX - ox) / sc, wy = (e.clientY - oy) / sc;
+  mouse.x = wx; mouse.y = wy;
+  if (me.dead) return;
+  // armed: left click / tap shoots, right click moves
+  if (me.armed && e.button === 0) { me.aim = Math.atan2(wy - me.y, wx - me.x); fire(); return; }
+  me.tx = num(wx, R, RW - R);
+  me.ty = num(wy, R, RH - R);
+};
+
+COLORS.forEach(c => {
+  const s = document.createElement("div");
+  s.className = "sw" + (c === me.color ? " on" : ""); s.style.background = c;
+  s.onclick = () => { me.color = c; document.querySelectorAll(".sw").forEach(x => x.classList.toggle("on", x === s)); sendPos(); };
+  $("sws").appendChild(s);
+});
+
+// ---- drawing ----
+function fit() { W = cv.width = innerWidth; H = cv.height = innerHeight; sc = Math.min(W / RW, H / RH); ox = (W - RW * sc) / 2; oy = (H - RH * sc) / 2; }
+addEventListener("resize", fit); fit();
+
+function box(x, y, w, h, c, r) { g.fillStyle = c; g.beginPath(); g.roundRect(x, y, w, h, r || 10); g.fill(); }
+function who(o, mine) {
+  if (o.dead) return;
+  const now = Date.now();
+  if (mine && now < me.shield) g.globalAlpha = 0.45 + 0.25 * Math.sin(now / 60);
+  const run = Math.min(1, (o.run || 0) / SPEED), bob = Math.abs(Math.sin(o.ph || 0)) * 4 * run;
+  g.fillStyle = "rgba(255,255,255,.07)"; g.beginPath();   // shadow shrinks while you hop
+  g.ellipse(o.x, o.y + R - 1, R * (0.95 - bob * 0.03), 5 - bob * 0.3, 0, 0, 7); g.fill();
+  g.save(); g.translate(o.x, o.y - bob); g.rotate(o.ang || 0);
+  const k = 1 + (o.s || 0), pu = 1 + (bob / 4 - 0.5) * 0.08 * run;   // stretch along motion, squash on each landing
+  g.scale(k * pu, pu / k);
+  g.fillStyle = o.color; g.beginPath(); g.arc(0, 0, R, 0, 7); g.fill();
+  g.lineWidth = mine ? 3 : 1.5; g.strokeStyle = mine ? "#fff" : "rgba(0,0,0,.4)"; g.stroke();
+  g.restore();
+  if (o.armed) {
+    g.save(); g.translate(o.x, o.y - bob); g.rotate(o.aim || 0);
+    box(R - 3, -3, 18, 6, "#ddd", 2); box(R + 12, -3, 6, 6, "#fff", 2);
+    g.restore();
+  }
+  g.fillStyle = "#fff"; g.font = "13px system-ui"; g.textAlign = "center";
+  g.fillText(mine ? name : o.name, o.x, o.y + R + 15);
+  if (o.hp < MAXHP) {
+    const f = Math.max(0, o.hp) / MAXHP;
+    box(o.x - 16, o.y + R + 21, 32, 4, "rgba(255,255,255,.2)", 2);
+    box(o.x - 16, o.y + R + 21, 32 * f, 4, f > 0.5 ? "#69db7c" : f > 0.25 ? "#ffd43b" : "#ff6b6b", 2);
+  }
+  if (o.say && now < o.until) {
+    const w = Math.min(220, g.measureText(o.say).width + 16);
+    box(o.x - w / 2, o.y - R - 34, w, 24, "rgba(255,255,255,.95)", 12);
+    g.fillStyle = "#222"; g.fillText(o.say.length > 30 ? o.say.slice(0, 29) + "..." : o.say, o.x, o.y - R - 17);
+  }
+  g.globalAlpha = 1;
+}
+function render(now) {
+  g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+  g.save(); g.translate(ox, oy); g.scale(sc, sc);
+  box(0, 0, RW, RH, "#141414", 24);
+  box(120, 120, 360, 200, "#2a2a2a", 30);          // rug
+  box(160, 560, 320, 90, "#6b4f6e", 20);           // couch
+  box(760, 140, 260, 140, "#7a5c3e", 18);          // table
+  box(840, 520, 220, 160, "#3d5a4c", 40);          // plant corner
+  GUNS.forEach(s => {                               // gun pickups
+    if (!s.up) return;
+    g.strokeStyle = "rgba(255,255,255," + (0.3 + 0.25 * Math.sin(now / 250)) + ")"; g.lineWidth = 2;
+    g.beginPath(); g.arc(s.x, s.y, 26, 0, 7); g.stroke();
+    box(s.x - 12, s.y - 5, 24, 9, "#d0d0d0", 2); box(s.x - 9, s.y + 3, 7, 11, "#9a9a9a", 2); box(s.x + 8, s.y - 3, 9, 5, "#fff", 1);
+  });
+  puffs.forEach(p => {
+    const f = p.life / p.max;
+    g.globalAlpha = Math.max(0, f * 0.4); g.fillStyle = "#ebebeb";
+    g.beginPath(); g.arc(p.x, p.y, p.r + (1 - f) * 10, 0, 7); g.fill();
+  });
+  g.globalAlpha = 1;
+  others.forEach(o => who(o, false));
+  who(me, true);
+  bullets.forEach(b => {
+    g.strokeStyle = b.c; g.lineWidth = 3; g.beginPath(); g.moveTo(b.x - b.vx * 0.03, b.y - b.vy * 0.03); g.lineTo(b.x, b.y); g.stroke();
+    g.fillStyle = "#fff"; g.beginPath(); g.arc(b.x, b.y, 3, 0, 7); g.fill();
+  });
+  parts.forEach(p => {
+    g.globalAlpha = Math.max(0, p.life / p.max); g.fillStyle = p.c;
+    g.beginPath(); g.arc(p.x, p.y, p.r, 0, 7); g.fill();
+  });
+  g.globalAlpha = 1;
+  g.restore();
+  g.textAlign = "center";
+  if (me.dead) {
+    g.fillStyle = "#fff"; g.font = "28px system-ui"; g.fillText("You exploded!", W / 2, H / 2 - 6);
+    g.font = "16px system-ui"; g.fillText("Respawning in " + Math.max(1, Math.ceil((me.respawnAt - now) / 1000)), W / 2, H / 2 + 22);
+  } else if (me.armed && now < hintUntil) {
+    g.fillStyle = "rgba(255,255,255,.8)"; g.font = "14px system-ui";
+    g.fillText("Aim with the mouse. Click or Space to shoot. WASD or right-click to move.", W / 2, 70);
+  }
+}
+
+// ---- main loop ----
+let prev = performance.now();
+function tick(t) {
+  const dt = Math.min(0.05, (t - prev) / 1000); prev = t;
+  const now = Date.now();
+  if (me.dead && now >= me.respawnAt) respawn();
+  me.aim = Math.atan2(mouse.y - me.y, mouse.x - me.x);
+
+  let dx = 0, dy = 0;
+  if (!me.dead) {
+    if (keys.has("arrowleft") || keys.has("a")) dx -= 1;
+    if (keys.has("arrowright") || keys.has("d")) dx += 1;
+    if (keys.has("arrowup") || keys.has("w")) dy -= 1;
+    if (keys.has("arrowdown") || keys.has("s")) dy += 1;
+    if (!dx && !dy && me.tx !== null) {
+      const ex = me.tx - me.x, ey = me.ty - me.y, d = Math.hypot(ex, ey);
+      if (d < 4) me.tx = me.ty = null; else { dx = ex / d; dy = ey / d; }
+    }
+  }
+  if (dx || dy) {
+    const l = Math.hypot(dx, dy) || 1;
+    me.x = num(me.x + dx / l * SPEED * dt, R, RW - R); me.y = num(me.y + dy / l * SPEED * dt, R, RH - R);
+    if (now - lastSend > 100) sendPos();
+  } else if (me.armed && !me.dead && Math.abs(me.aim - lastAim) > 0.08 && now - lastSend > 120) {
+    sendPos();
+  }
+
+  animate(me, dt);
+
+  // gun pickups
+  GUNS.forEach((s, i) => {
+    if (!s.up && now - s.at > GUN_RESPAWN_MS) s.up = true;
+    if (s.up && !me.dead && !me.armed && Math.hypot(me.x - s.x, me.y - s.y) < R + 14) {
+      me.armed = true; s.up = false; s.at = now; hintUntil = now + 7000;
+      send("grab", { id, s: i });
+      sendPos();
+    }
+  });
+
+  // bullets
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i], px = b.x, py = b.y;
+    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+    if (b.life <= 0 || b.x < 0 || b.x > RW || b.y < 0 || b.y > RH) { bullets.splice(i, 1); continue; }
+    if (b.owner !== id && !me.dead && now >= me.shield && segDist(me.x, me.y, px, py, b.x, b.y) < R + 3) {
+      bullets.splice(i, 1);
+      hurt(b);
+    }
+  }
+
+  // smoke puffs
+  for (let i = puffs.length - 1; i >= 0; i--) {
+    const p = puffs[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+    if (p.life <= 0) puffs.splice(i, 1);
+  }
+
+  // particles
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    const f = Math.max(0, 1 - 2.2 * dt); p.vx *= f; p.vy *= f;
+    p.life -= dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+
+  others.forEach((o, k) => {
+    if (now - o.seen > 5000) { others.delete(k); return; }
+    o.x += (o.tx - o.x) * 0.25; o.y += (o.ty - o.y) * 0.25;
+    animate(o, dt);
+  });
+
+  const cur = me.armed && !me.dead ? "crosshair" : "default";
+  if (cv.style.cursor !== cur) cv.style.cursor = cur;
+  render(now); requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
