@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Hangout</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font: 14px system-ui, sans-serif; color: #eee; }
+  canvas { display: block; touch-action: none; }
+  #top { position: fixed; top: 0; left: 0; right: 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 10px; background: rgba(0,0,0,.85); }
+  .sw { width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; box-sizing: border-box; }
+  .sw.on { border-color: #fff; box-shadow: inset 0 0 0 2px #000; }
+  #nm { width: 110px; box-sizing: border-box; padding: 4px 8px; border: 1px solid #444; border-radius: 6px; background: #1a1a1a; color: #fff; font: inherit; outline: none; }
+  #nm:focus { border-color: #fff; }
+  #status { margin-left: auto; font-size: 12px; opacity: .7; }
+  #chat { position: fixed; left: 10px; bottom: 10px; width: min(360px, calc(100% - 20px)); pointer-events: none; }
+  #msg, #chat.open #log { pointer-events: auto; }
+  #log { height: 200px; overflow-y: auto; padding: 6px 8px; background: rgba(0,0,0,.8); border-radius: 8px 8px 0 0; font-size: 13px; }
+  #log div { margin: 2px 0; word-wrap: break-word; }
+  #log b { margin-right: 5px; }
+  #msg { width: 100%; box-sizing: border-box; padding: 9px; border: 0; border-radius: 0 0 8px 8px; background: #222; color: #fff; font: inherit; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="top"><span>Color</span><span id="sws" style="display:flex;gap:4px"></span><span>Name</span><input id="nm" maxlength="20" placeholder="Your name" autocomplete="off"><span id="status">connecting</span></div>
+<div id="chat"><div id="log"></div><input id="msg" maxlength="200" placeholder="Press C to chat" autocomplete="off"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script>
+// ---- Use the same values as your other Supabase files ----
+const SUPABASE_URL = "https://twnudsfinxmyjzofirmh.supabase.co";
+const SUPABASE_KEY = "sb_publishable_yaiGtjLBgjAid0f6cwj2Vw_mCMsDlUQ";
+// -----------------------------------------------------------
+
+const RW = 1200, RH = 800, CW = 1400, CH = 900, R = 16, SPEED = 260;
+const DOOR = { y0: 250, y1: 650 };          // the doorway on the chill room's right wall
+const MAXHP = 100, DMG = 25, BULLET_SPEED = 900, BULLET_LIFE = 1.1, COOLDOWN = 200;
+const RESPAWN_MS = 5000, SHIELD_MS = 1500, GUN_RESPAWN_MS = 10000;
+const DASH_SPEED = 900, DASH_TIME = 0.14, DASH_CD = 900, FREEZE_MS = 120, FREEZE_SOFT_MS = 60;
+const JUICE = 0.65;          // parry intensity knob: 1 = full chaos, 0 = none
+const PARRY_WINDOW = 0.16, PARRY_CD = 650, PARRY_R = 30;   // F: a short window; bullets touching the ring get sent back
+const COLORS = ["#ff6b6b", "#ffa94d", "#ffd43b", "#69db7c", "#38d9a9", "#ffffff", "#9775fa", "#f783ac"];
+const GUNS = [{ x: 600, y: 210, up: true, at: 0 }, { x: 600, y: 610, up: true, at: 0 }];
+const $ = id => document.getElementById(id);
+const cv = $("cv"), g = cv.getContext("2d"), logEl = $("log"), msgEl = $("msg"), nmEl = $("nm");
+
+let name = "";
+try { name = localStorage.getItem("hg_name") || ""; } catch (e) {}
+if (!name.trim()) name = "Guest" + (100 + Math.floor(Math.random() * 900));
+name = name.trim().slice(0, 20);
+try { localStorage.setItem("hg_name", name); } catch (e) {}
+nmEl.value = name;
+
+const id = Math.random().toString(36).slice(2, 10);
+const me = {
+  x: 650 + Math.random() * 300, y: CH / 2 + (Math.random() - 0.5) * 400, room: "chill", color: COLORS[Math.floor(Math.random() * COLORS.length)], tx: null, ty: null, say: "", until: 0,
+  hp: MAXHP, armed: false, dead: false, aim: 0, shield: 0, respawnAt: 0, pts: 0
+};
+const others = new Map(), keys = new Set();
+const bullets = [], parts = [], puffs = [], floats = [], ghosts = [], rings = [], mouse = { x: RW / 2 + 100, y: RH / 2 };
+let W, H, sc = 1, ox = 0, oy = 0, lastSend = 0, moved = false, online = false;
+let camX0 = 0, camY0 = 0, camS = 1, curX = innerWidth / 2 + 100, curY = innerHeight / 2;
+const cam = { x: 0, y: 0, room: "" };
+let lastShot = 0, shots = 0, lastAim = 0, hintUntil = 0, queuedShot = false;
+let freezeUntil = 0, flash = 0, flashCol = "255,255,255", debt = 0, catchUntil = 0, lastDash = 0, lastParry = 0, parryCombo = 0, lastParryHit = 0, parryBuf = 0, big = null, shake = 0, hitMarkUntil = 0, toastMsg = "", toastUntil = 0, muted = false, lock = null, ac = null;
+let assist = true;
+try { assist = localStorage.getItem("hg_assist") !== "0"; } catch (e) {}
+
+function setStatus(s) { $("status").textContent = s; }
+if (SUPABASE_URL.startsWith("PASTE")) { setStatus("add your Supabase URL and key at the top of the file"); throw new Error("Supabase not configured"); }
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { realtime: { params: { eventsPerSecond: 40 } } });
+const room = sb.channel("hangout", { config: { broadcast: { self: false } } });
+
+const num = (v, lo, hi) => Math.min(hi, Math.max(lo, +v || 0));
+function send(event, payload) { if (online) room.send({ type: "broadcast", event, payload }); }
+function sendPos() {
+  if (!online) return;
+  send("pos", { id, name, color: me.color, x: me.x, y: me.y, hp: Math.round(me.hp), armed: me.armed, aim: +me.aim.toFixed(2), dead: me.dead, room: me.room, pts: me.pts || 0 });
+  lastSend = Date.now(); lastAim = me.aim;
+}
+
+// ---- particles ----
+function explode(x, y, c, room) {
+  for (let i = 0; i < 44; i++) {
+    const a = Math.random() * 6.283, s = 60 + Math.random() * 300, life = 0.6 + Math.random() * 0.9;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, r: 2 + Math.random() * 4, c, rm: room || "main" });
+  }
+  if (parts.length > 600) parts.splice(0, parts.length - 600);
+}
+function sparks(x, y, c, n, room) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.283, s = 40 + Math.random() * 120, life = 0.25 + Math.random() * 0.25;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, r: 1.5 + Math.random() * 1.5, c, rm: room || "main" });
+  }
+}
+
+// ---- run personality: smoke puffs + squash & stretch ----
+function puff(x, y, dx, dy, room) {
+  const life = 0.35 + Math.random() * 0.25;
+  puffs.push({
+    x: x - dx * R * 0.9 + (Math.random() - 0.5) * 6, y: y - dy * R * 0.9 + (Math.random() - 0.5) * 6 + 4,
+    vx: -dx * 25 + (Math.random() - 0.5) * 30, vy: -dy * 25 + (Math.random() - 0.5) * 30 - 8,
+    life, max: life, r: 3 + Math.random() * 3, rm: room || "main"
+  });
+  if (puffs.length > 300) puffs.shift();
+}
+// works for you and for everyone else: measures how fast the circle is moving,
+// then springs the stretch toward it so it overshoots (jelly wobble) when you stop
+function animate(o, dt) {
+  if (dt < 0.001) return;
+  if (o.px === undefined || o.dead) { o.px = o.x; o.py = o.y; o.s = 0; o.sv = 0; o.run = 0; return; }
+  let vx = (o.x - o.px) / dt, vy = (o.y - o.py) / dt, sp = Math.hypot(vx, vy);
+  o.px = o.x; o.py = o.y;
+  if (sp > 2600) { vx = vy = sp = 0; }            // teleport (respawn), not running
+  if (sp > 20) o.ang = Math.atan2(vy, vx);
+  const target = Math.min(0.55, sp / SPEED * 0.32);
+  o.sv = (o.sv || 0) + (220 * (target - (o.s || 0)) - 18 * (o.sv || 0)) * dt;
+  o.s = Math.max(-0.35, Math.min(0.5, (o.s || 0) + o.sv * dt));
+  o.ph = (o.ph || 0) + sp * dt * 0.06;                  // step cycle advances with distance run
+  o.run = sp;
+  o.pt = (o.pt || 0) + dt;
+  if (sp > 80 && o.pt > 0.05) { o.pt = 0; puff(o.x, o.y, vx / sp, vy / sp, o.room); }
+  if (o.dashUntil && Date.now() < o.dashUntil) {         // dash trail: after-images + dense smoke
+    ghosts.push({ x: o.x, y: o.y, c: o.color, life: 0.22, max: 0.22, rm: o.room || "main" });
+    puff(o.x, o.y, o.dashDx || 0, o.dashDy || 0, o.room); puff(o.x, o.y, o.dashDx || 0, o.dashDy || 0, o.room);
+    if (ghosts.length > 200) ghosts.shift();
+  }
+}
+
+// ---- aim helpers: toast, sound, aim assist ----
+function toast(t, ms) {
+  // Normalize any stale/legacy kill message so it can never tell the killer they died.
+  t = String(t);
+  t = t.replace(/^You\s+died\s+(.+?)!?$/i, "You killed $1!");
+  toastMsg = t; toastUntil = Date.now() + (ms || 1500);
+}
+function sfx(type, vol, pm) {
+  if (muted) return;
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    if (ac.state === "suspended") ac.resume();
+    const S = {                                  // [wave, start pitch, end pitch, seconds, loudness]
+      shoot: ["square", 520, 120, 0.09, 0.05], hit: ["triangle", 880, 1300, 0.07, 0.09],
+      hurt: ["sawtooth", 220, 80, 0.15, 0.12], kill: ["triangle", 600, 1500, 0.22, 0.12],
+      boom: ["sawtooth", 160, 40, 0.3, 0.16], pick: ["square", 400, 900, 0.1, 0.07], dash: ["triangle", 700, 200, 0.14, 0.07],
+      parry: ["square", 1400, 2600, 0.14, 0.12], thud: ["sine", 140, 35, 0.28, 0.3],
+      whiff: ["triangle", 500, 900, 0.08, 0.04], super: ["sawtooth", 300, 1800, 0.25, 0.1]
+    }[type];
+    const t = ac.currentTime, o = ac.createOscillator(), v = ac.createGain();
+    o.type = S[0]; o.frequency.setValueAtTime(S[1] * (pm || 1), t); o.frequency.exponentialRampToValueAtTime(S[2] * (pm || 1), t + S[3]);
+    v.gain.setValueAtTime(S[4] * (vol || 1), t); v.gain.exponentialRampToValueAtTime(0.0001, t + S[3]);
+    o.connect(v); v.connect(ac.destination); o.start(t); o.stop(t + S[3] + 0.02);
+  } catch (e) {}
+}
+function angDiff(a, b) { const d = a - b; return Math.atan2(Math.sin(d), Math.cos(d)); }
+// soft aim assist: if an enemy is close to where you're pointing, aim at them (and a bit ahead of
+// where they're running, so moving targets get hit). Close enemies get a wider "magnet".
+function assistAim() {
+  let best = null, bestS = 1;
+  others.forEach(o => {
+    if (o.dead || o.room !== me.room) return;
+    const dx = o.x - me.x, dy = o.y - me.y, d = Math.hypot(dx, dy);
+    if (d < 20 || d > BULLET_SPEED * BULLET_LIFE * 0.9) return;
+    const lim = 0.3 + 0.3 * Math.max(0, 1 - d / 300);
+    const sc2 = Math.abs(angDiff(Math.atan2(dy, dx), me.aim)) / lim;
+    if (sc2 < bestS) { bestS = sc2; best = o; }
+  });
+  if (!best) return null;
+  const d = Math.hypot(best.x - me.x, best.y - me.y), sp = best.run || 0, t = d / BULLET_SPEED * 0.8;
+  const px = best.x + Math.cos(best.ang || 0) * sp * t, py = best.y + Math.sin(best.ang || 0) * sp * t;
+  const ta = Math.atan2(py - me.y, px - me.x);
+  return { a: me.aim + angDiff(ta, me.aim) * 0.85, o: best, px, py };
+}
+
+// ---- dash + hit-stop ----
+// hit-stop: the whole world pauses for a split second on a kill, with a white flash.
+// Messages from other players keep arriving while it's paused, so afterwards everyone
+// is smoothly pulled into their real positions (see "catchUntil" in the main loop).
+function hitstop(ms, amt, col) { freezeUntil = Math.max(freezeUntil, Date.now() + ms); flash = Math.max(flash, amt); flashCol = col || "255,255,255"; }
+function dash() {
+  const now = Date.now();
+  if (me.dead || now < freezeUntil || now - lastDash < DASH_CD || me.dashT > 0) return;
+  let dx = 0, dy = 0;
+  if (keys.has("arrowleft") || keys.has("a")) dx -= 1;
+  if (keys.has("arrowright") || keys.has("d")) dx += 1;
+  if (keys.has("arrowup") || keys.has("w")) dy -= 1;
+  if (keys.has("arrowdown") || keys.has("s")) dy += 1;
+  if (!dx && !dy && me.tx !== null) { dx = me.tx - me.x; dy = me.ty - me.y; }   // walking to a click: dash that way
+  if (!dx && !dy) { dx = Math.cos(me.aim); dy = Math.sin(me.aim); }              // standing still: dash toward the cursor
+  const l = Math.hypot(dx, dy) || 1;
+  me.dashDx = dx / l; me.dashDy = dy / l; me.dashT = DASH_TIME; me.dashUntil = now + DASH_TIME * 1000; lastDash = now;
+  shake = Math.max(shake, 2); sfx("dash");
+  send("dash", { id, dx: me.dashDx, dy: me.dashDy });
+  sendPos();
+}
+
+// ---- free-play: no rounds, timers, or score resets ----\n// ---- rooms + camera ----
+// chill room (big, camera follows you) = where you spawn. Walk through its door to enter the arena
+// (the fixed-camera room with the guns). There is no door back: you return to the chill room by dying.
+function dims(room) { return room === "chill" ? [CW, CH] : [RW, RH]; }
+function updateCam(dt) {
+  if (me.room === "chill") {
+    const z = Math.max(0.6, Math.min(W / 1000, H / 650)), hw = W / (2 * z), hh = H / (2 * z);
+    if (cam.room !== "chill") { cam.x = me.x; cam.y = me.y; cam.room = "chill"; }     // snap when you arrive
+    const f = 1 - Math.exp(-8 * dt);
+    cam.x += (me.x - cam.x) * f; cam.y += (me.y - cam.y) * f;
+    const tx = CW > 2 * hw ? Math.max(hw, Math.min(CW - hw, cam.x)) : CW / 2;           // don't show past the walls
+    const ty = CH > 2 * hh ? Math.max(hh, Math.min(CH - hh, cam.y)) : CH / 2;
+    camS = z; camX0 = W / 2 - tx * z; camY0 = H / 2 - ty * z;
+  } else { cam.room = "main"; camS = sc; camX0 = ox; camY0 = oy; }
+}
+function enterArena() {
+  me.room = "main"; me.x = 70; me.y = RH / 2; me.tx = me.ty = null; me.dashT = 0;
+  me.shield = Date.now() + SHIELD_MS; flash = Math.max(flash, 0.7); sfx("pick");
+  toast("Welcome to the arena.", 1800);
+  sendPos();
+}
+
+// ---- parry ----
+// F opens a short parry window. Any bullet that touches the ring during it is knocked back at the
+// shooter: faster and harder each time it's parried (so two players can rally it back and forth).
+// Rewards: heal, instant dash, no cooldown, brief invincibility, hit-stop, gold flash, shake, shockwave, combo counter.
+function bang(t, sub) { const now = Date.now(); big = { t, sub: sub || "", at: now, until: now + 650 }; }
+function ring(x, y, r1, c, life) { rings.push({ x, y, r0: 12, r1, life, max: life, c, rm: "main" }); }
+function parry() {
+  const now = Date.now();
+  if (me.dead || me.room !== "main") return;
+  if (now < freezeUntil) { parryBuf = now; return; }              // pressed during a freeze: go the moment it ends
+  if (now - lastParry < PARRY_CD) return;                          // whiffing costs you a moment
+  lastParry = now; me.parryT = PARRY_WINDOW; sfx("whiff");
+  send("pw", { id });
+}
+function doParry(b) {
+  const now = Date.now(), l = assist ? assistAim() : null, a = l ? l.a : me.aim;
+  b.owner = id; b.par = (b.par || 0) + 1;
+  const sp = BULLET_SPEED * (1.5 + 0.25 * (b.par - 1));
+  b.x = me.x + Math.cos(a) * (R + 18); b.y = me.y + Math.sin(a) * (R + 18);
+  b.vx = Math.cos(a) * sp; b.vy = Math.sin(a) * sp; b.life = BULLET_LIFE; b.c = "#ffd43b"; b.dmg = Math.min(100, DMG + 25 * b.par);
+  parryCombo = now - lastParryHit < 2500 ? parryCombo + 1 : 1; lastParryHit = now;
+  me.hp = Math.min(MAXHP, me.hp + 20); lastDash = 0; lastParry = 0;
+  me.shield = Math.max(me.shield, now + 350);
+  floats.push({ x: me.x, y: me.y - R - 6, t: "+20", c: "#69db7c", s: 20, life: 0.9, max: 0.9 });
+  sparks(me.x, me.y, "#ffd43b", 18); sparks(me.x, me.y, "#fff", 8);
+  ring(me.x, me.y, 100 + Math.min(parryCombo, 5) * 12, "#ffd43b", 0.3);
+  shake = Math.max(shake, (8 + Math.min(parryCombo, 4)) * JUICE);
+  hitstop(Math.round((90 + Math.min(parryCombo, 4) * 12) * JUICE), 0.8 * JUICE, "255,215,90");
+  bang("PARRY", parryCombo > 1 ? "x" + parryCombo : "");
+  const pm = 1 + 0.1 * Math.min(parryCombo - 1, 9);                // every combo hit rings higher
+  sfx("parry", 0.8, pm); sfx("thud", 0.5);
+  send("parry", { id, b: b.id, x: b.x, y: b.y, a, par: b.par, cx: me.x, cy: me.y });
+  sendPos();
+}
+
+// ---- bullets ----
+function addBullet(owner, bid, x, y, a, c) {
+  bullets.push({ id: bid, owner, x, y, vx: Math.cos(a) * BULLET_SPEED, vy: Math.sin(a) * BULLET_SPEED, life: BULLET_LIFE, c });
+  if (bullets.length > 300) bullets.shift();
+}
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+  let t = l2 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+function fire() {
+  const now = Date.now();
+  if (!me.armed || me.dead) return;
+  if (now < freezeUntil) { queuedShot = true; return; }
+  if (now - lastShot < COOLDOWN) { if (now - lastShot > COOLDOWN - 120) queuedShot = true; return; }
+  queuedShot = false;
+  lastShot = now;
+  const l = assist ? assistAim() : null, a = l ? l.a : me.aim;
+  const sx = me.x + Math.cos(a) * (R + 14), sy = me.y + Math.sin(a) * (R + 14);
+  const bid = id + ":" + (shots++);
+  addBullet(id, bid, sx, sy, a, me.color);
+  send("shot", { id, b: bid, x: sx, y: sy, a, c: me.color });
+  me.kick = 1; shake = Math.max(shake, 1.5); sfx("shoot");
+}
+// you are the one who decides if you got hit (no server), then tell everyone
+function hurt(b) {
+  const d = b.dmg || DMG;
+  me.hp -= d;
+  sparks(b.x, b.y, me.color, 6);
+  shake = Math.max(shake, d > DMG ? 9 : 7); sfx("hurt");
+  floats.push({ x: me.x, y: me.y - R - 6, t: "-" + d, c: "#ff6b6b", life: 0.8, max: 0.8 });
+  send("hit", { id, b: b.id, x: b.x, y: b.y, hp: Math.max(0, me.hp), dmg: d });
+  if (me.hp <= 0) die(b.owner, b.par); else sendPos();
+}
+function die(by, par) {
+  me.hp = 0; me.dead = true; me.armed = false; me.tx = me.ty = null; me.respawnAt = Date.now() + RESPAWN_MS;
+  const o = others.get(by), killer = o && o.name ? o.name : "someone";
+  explode(me.x, me.y, me.color);
+  shake = 14; sfx("boom"); me.dashT = 0; me.parryT = 0; parryCombo = 0; hitstop(FREEZE_MS, 0.9);
+  addLog("\u2620", name + " was killed by " + killer, "#aaa");
+  send("die", { id, name, color: me.color, x: me.x, y: me.y, by: killer, byId: by, par: par || 0 });
+  sendPos();
+}
+function respawn() {
+  me.dead = false; me.hp = MAXHP; me.armed = false; me.dashT = 0;
+  me.room = "chill"; me.x = 650 + Math.random() * 300; me.y = CH / 2 + (Math.random() - 0.5) * 400; me.tx = me.ty = null;
+  me.shield = Date.now() + SHIELD_MS;
+  sendPos();
+}
+
+room.on("broadcast", { event: "pos" }, ({ payload: p }) => {
+  if (!p || typeof p.id !== "string") return;
+  const nx = num(p.x, 0, CW), ny = num(p.y, 0, CH), rm = p.room === "chill" ? "chill" : "main";
+  let o = others.get(p.id);
+  if (!o) { o = { x: nx, y: ny, say: "", until: 0, aim: 0, dead: false, room: rm }; others.set(p.id, o); }
+  if ((o.dead && !p.dead) || o.room !== rm) { o.x = nx; o.y = ny; }
+  o.room = rm; o.pts = num(p.pts, 0, 9999);
+  o.name = String(p.name || "?").slice(0, 20);
+  o.color = COLORS.includes(p.color) ? p.color : COLORS[0];
+  o.tx = nx; o.ty = ny; o.seen = Date.now();
+  o.hp = p.hp === undefined ? MAXHP : num(p.hp, 0, MAXHP);
+  o.armed = !!p.armed; o.dead = !!p.dead;
+  if (typeof p.aim === "number" && isFinite(p.aim)) o.aim = p.aim;
+}).on("broadcast", { event: "chat" }, ({ payload: p }) => {
+  if (!p || typeof p.text !== "string") return;
+  const text = p.text.slice(0, 200), nm = String(p.name || "?").slice(0, 20);
+  const o = others.get(p.id);
+  if (o) { o.say = text; o.until = Date.now() + 6000; }
+  addLog(nm, text, o ? o.color : "#ccc");
+}).on("broadcast", { event: "shot" }, ({ payload: p }) => {
+  if (!p || typeof p.id !== "string" || typeof p.b !== "string") return;
+  const a = +p.a; if (!isFinite(a)) return;
+  addBullet(p.id, p.b, num(p.x, 0, RW), num(p.y, 0, RH), a, COLORS.includes(p.c) ? p.c : "#fff");
+  const o = others.get(p.id);
+  if (o) { o.aim = a; o.armed = true; o.kick = 1; }
+  sfx("shoot", 0.4);
+}).on("broadcast", { event: "hit" }, ({ payload: p }) => {
+  if (!p || typeof p.b !== "string") return;
+  const i = bullets.findIndex(b => b.id === p.b);
+  const mine = i >= 0 && bullets[i].owner === id;          // did MY bullet land?
+  if (i >= 0) bullets.splice(i, 1);
+  const v = others.get(p.id), hx = num(p.x, 0, RW), hy = num(p.y, 0, RH);
+  sparks(hx, hy, v ? v.color : "#fff", 6);
+  const dm = num(p.dmg, 0, 100) || DMG, sup = dm > DMG;          // a parried bullet hit someone
+  floats.push({ x: hx, y: hy - 12, t: "-" + dm, c: sup ? "#ffd43b" : "#fff", s: sup ? 22 : 16, life: sup ? 0.9 : 0.8, max: sup ? 0.9 : 0.8 });
+  if (sup) { sparks(hx, hy, "#ffd43b", 14); ring(hx, hy, 70, "#ffd43b", 0.25); }
+  if (mine) { hitMarkUntil = Date.now() + (sup ? 360 : 220); sfx("hit", 1, sup ? 1.5 : 1); if (sup) { shake = Math.max(shake, 5); sfx("thud", 0.4); } }
+  if (v) v.hp = num(p.hp, 0, MAXHP);
+}).on("broadcast", { event: "die" }, ({ payload: p }) => {
+  if (!p || typeof p.id !== "string") return;
+  const o = others.get(p.id);
+  if (o) { o.dead = true; o.hp = 0; o.armed = false; }
+  const nm = String(p.name || "?").slice(0, 20), by = String(p.by || "someone").slice(0, 20);
+  explode(num(p.x, 0, RW), num(p.y, 0, RH), COLORS.includes(p.color) ? p.color : "#fff");
+  addLog("\u2620", nm + " was killed by " + by, "#aaa");
+  if (p.byId === id) { toast("You killed " + nm + "!", 2200); shake = Math.max(shake, 8); sfx("boom"); sfx("kill"); hitstop(FREEZE_MS, 0.9); if (p.par) { bang("PARRY KILL!", nm); hitstop(130, 0.6, "255,215,90"); } }
+  else if (me.room === "main") { shake = Math.max(shake, 4); sfx("boom"); hitstop(FREEZE_SOFT_MS, 0.25); }   // the chill room doesn't feel it
+}).on("broadcast", { event: "pw" }, ({ payload: p }) => {
+  const o = p && others.get(p.id);
+  if (o) o.parryUntil = Date.now() + PARRY_WINDOW * 1000;
+}).on("broadcast", { event: "parry" }, ({ payload: p }) => {
+  if (!p || typeof p.b !== "string") return;
+  const a = +p.a; if (!isFinite(a)) return;
+  const par = num(p.par, 1, 10), cx = num(p.cx, 0, RW), cy = num(p.cy, 0, RH);
+  const b = bullets.find(q => q.id === p.b);
+  if (b) {
+    const prev = b.owner, sp = BULLET_SPEED * (1.5 + 0.25 * (par - 1));
+    b.owner = p.id; b.par = par; b.x = num(p.x, 0, RW); b.y = num(p.y, 0, RH);
+    b.vx = Math.cos(a) * sp; b.vy = Math.sin(a) * sp; b.life = BULLET_LIFE; b.c = "#ffd43b"; b.dmg = Math.min(100, DMG + 25 * par);
+    if (prev === id) { toast("Your shot got parried!", 1500); hitstop(50, 0.15, "255,215,90"); sfx("hurt", 0.6); }
+  }
+  if (me.room === "main") { sparks(cx, cy, "#ffd43b", 14); ring(cx, cy, 90, "#ffd43b", 0.25); shake = Math.max(shake, 3); sfx("parry", 0.3, 1 + 0.1 * (par - 1)); }
+  const o = others.get(p.id); if (o) o.parryUntil = 0;
+}).on("broadcast", { event: "dash" }, ({ payload: p }) => {
+  const o = p && others.get(p.id);
+  if (!o || !isFinite(+p.dx) || !isFinite(+p.dy)) return;
+  o.dashUntil = Date.now() + DASH_TIME * 1000; o.dashDx = +p.dx; o.dashDy = +p.dy;
+  sfx("dash", 0.4);
+}).on("broadcast", { event: "grab" }, ({ payload: p }) => {
+  if (!p) return;
+  const s = GUNS[p.s | 0];
+  if (s) { s.up = false; s.at = Date.now(); }
+  const o = others.get(p.id);
+  if (o) o.armed = true;
+}).subscribe(s => {
+  online = s === "SUBSCRIBED";
+  setStatus(s === "SUBSCRIBED" ? "online" : s === "TIMED_OUT" || s === "CHANNEL_ERROR" ? "connection lost" : "connecting");
+  if (s === "SUBSCRIBED") sendPos();
+});
+setInterval(sendPos, 1500);
+
+function addLog(nm, text, color) {
+  const d = document.createElement("div"), b = document.createElement("b"), t = document.createElement("span");
+  b.textContent = nm; b.style.color = color; t.textContent = text;
+  d.append(b, t); logEl.appendChild(d);
+  while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ---- change name ----
+function applyName() {
+  const v = nmEl.value.trim().slice(0, 20);
+  if (!v) { nmEl.value = name; return; }
+  nmEl.value = v;
+  if (v === name) return;
+  name = v;
+  try { localStorage.setItem("hg_name", name); } catch (e) {}
+  sendPos();
+}
+nmEl.onkeydown = e => {
+  e.stopPropagation();
+  if (e.key === "Escape") nmEl.value = name;
+  if (e.key === "Enter" || e.key === "Escape") nmEl.blur();
+};
+nmEl.onblur = applyName;
+
+// ---- input ----
+msgEl.onkeydown = e => {
+  e.stopPropagation();
+  if (e.key === "Escape") msgEl.blur();
+  if (e.key === "Enter") {
+    const text = msgEl.value.trim(); msgEl.value = "";
+    msgEl.blur();   // straight back to the game; press C for the next message
+    if (!text) return;
+    me.say = text; me.until = Date.now() + 6000;
+    addLog(name, text, me.color);
+    send("chat", { id, name, text });
+  }
+};
+msgEl.onfocus = () => { $("chat").classList.add("open"); msgEl.placeholder = "Enter to send, Esc to cancel"; };
+msgEl.onblur = () => { $("chat").classList.remove("open"); msgEl.placeholder = "Press C to chat"; };
+addEventListener("keydown", e => {
+  if (document.activeElement === msgEl || document.activeElement === nmEl) return;
+  if ((e.key === "c" || e.key === "C") && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); keys.clear(); msgEl.focus(); return; }
+  if (e.key === " ") { e.preventDefault(); if (!e.repeat) dash(); return; }
+  if (e.key === "Shift") { if (!e.repeat) dash(); return; }
+  if ((e.key === "e" || e.key === "E") && !e.ctrlKey && !e.metaKey && !e.altKey) { keys.add("e"); fire(); return; }
+  if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat) {
+    const k = e.key.toLowerCase();
+    if (k === "q") { assist = !assist; try { localStorage.setItem("hg_assist", assist ? "1" : "0"); } catch (err) {} toast("Aim assist " + (assist ? "on" : "off")); return; }
+    if (k === "m") { muted = !muted; toast(muted ? "Sound off" : "Sound on"); return; }
+    if (k === "f") { parry(); return; }
+  }
+  keys.add(e.key.toLowerCase()); me.tx = null;
+});
+addEventListener("keyup", e => keys.delete(e.key.toLowerCase()));
+addEventListener("blur", () => keys.clear());
+addEventListener("pointermove", e => { curX = e.clientX; curY = e.clientY; mouse.x = (curX - camX0) / camS; mouse.y = (curY - camY0) / camS; });
+addEventListener("contextmenu", e => { if (!e.target.closest("#top, #msg")) e.preventDefault(); });
+addEventListener("pointerdown", e => {
+  if (e.target.closest("#top, #msg")) return;   // clicking the name box / colors / chat box is not a shot
+  curX = e.clientX; curY = e.clientY;
+  const wx = (curX - camX0) / camS, wy = (curY - camY0) / camS;
+  mouse.x = wx; mouse.y = wy;
+  if (me.dead) return;
+  // any click walks you there (shooting is on E)
+  const [mw, mh] = dims(me.room);
+  me.tx = num(wx, R, mw - R);
+  me.ty = num(wy, R, mh - R);
+});
+
+COLORS.forEach(c => {
+  const s = document.createElement("div");
+  s.className = "sw" + (c === me.color ? " on" : ""); s.style.background = c;
+  s.onclick = () => { me.color = c; document.querySelectorAll(".sw").forEach(x => x.classList.toggle("on", x === s)); sendPos(); };
+  $("sws").appendChild(s);
+});
+
+// ---- drawing ----
+function fit() { W = cv.width = innerWidth; H = cv.height = innerHeight; sc = Math.min(W / RW, H / RH); ox = (W - RW * sc) / 2; oy = (H - RH * sc) / 2; }
+addEventListener("resize", fit); fit();
+
+function box(x, y, w, h, c, r) { g.fillStyle = c; g.beginPath(); g.roundRect(x, y, w, h, r || 10); g.fill(); }
+function who(o, mine) {
+  if (o.dead) return;
+  const now = Date.now();
+  if (mine && now < me.shield) g.globalAlpha = 0.45 + 0.25 * Math.sin(now / 60);
+  const run = Math.min(1, (o.run || 0) / SPEED), bob = Math.abs(Math.sin(o.ph || 0)) * 4 * run;
+  g.fillStyle = "rgba(255,255,255,.07)"; g.beginPath();   // shadow shrinks while you hop
+  g.ellipse(o.x, o.y + R - 1, R * (0.95 - bob * 0.03), 5 - bob * 0.3, 0, 0, 7); g.fill();
+  const kk = o.kick || 0, aimA = mine && lock ? lock.a : (o.aim || 0);
+  g.save(); g.translate(o.x - Math.cos(aimA) * kk * 3, o.y - bob - Math.sin(aimA) * kk * 3); g.rotate(o.ang || 0);
+  const k = 1 + (o.s || 0), pu = 1 + (bob / 4 - 0.5) * 0.08 * run;   // stretch along motion, squash on each landing
+  g.scale(k * pu, pu / k);
+  g.fillStyle = o.color; g.beginPath(); g.arc(0, 0, R, 0, 7); g.fill();
+  g.lineWidth = mine ? 3 : 1.5; g.strokeStyle = mine ? "#fff" : "rgba(0,0,0,.4)"; g.stroke();
+  g.restore();
+  const pt = mine ? (me.parryT || 0) / PARRY_WINDOW : Math.max(0, ((o.parryUntil || 0) - now) / (PARRY_WINDOW * 1000));
+  if (pt > 0) {                                      // parry ring: snaps outward
+    g.strokeStyle = "rgba(255,215,90," + (0.35 + pt * 0.6) + ")"; g.lineWidth = 4 * pt + 1.5;
+    g.beginPath(); g.arc(o.x, o.y - bob, R + 10 + (1 - pt) * 22, 0, 7); g.stroke();
+  }
+  if (o.armed) {
+    g.save(); g.translate(o.x, o.y - bob); g.rotate(aimA);
+    box(R - 3 - kk * 5, -3, 18, 6, "#ddd", 2); box(R + 12 - kk * 5, -3, 6, 6, "#fff", 2);
+    if (kk > 0.5) { g.fillStyle = "rgba(255,255,200," + ((kk - 0.5) * 2) + ")"; g.beginPath(); g.arc(R + 22, 0, 4 + kk * 8, 0, 7); g.fill(); }
+    g.restore();
+  }
+  g.fillStyle = "#fff"; g.font = "13px system-ui"; g.textAlign = "center";
+  g.fillText(mine ? name : o.name, o.x, o.y + R + 15);
+  if (o.hp < MAXHP) {
+    const f = Math.max(0, o.hp) / MAXHP;
+    box(o.x - 16, o.y + R + 21, 32, 4, "rgba(255,255,255,.2)", 2);
+    box(o.x - 16, o.y + R + 21, 32 * f, 4, f > 0.5 ? "#69db7c" : f > 0.25 ? "#ffd43b" : "#ff6b6b", 2);
+  }
+  if (o.say && now < o.until) {
+    const w = Math.min(220, g.measureText(o.say).width + 16);
+    box(o.x - w / 2, o.y - R - 34, w, 24, "rgba(255,255,255,.95)", 12);
+    g.fillStyle = "#222"; g.fillText(o.say.length > 30 ? o.say.slice(0, 29) + "..." : o.say, o.x, o.y - R - 17);
+  }
+  g.globalAlpha = 1;
+}
+function drawChill(now) {
+  box(0, 0, CW, CH, "#191919", 40);                                    // floor
+  for (let x = 100; x < CW; x += 200) box(x, 0, 2, CH, "rgba(255,255,255,.03)", 1);
+  g.fillStyle = "rgba(255,255,255,.05)"; g.font = "bold 90px system-ui"; g.textAlign = "center"; g.fillText("SAFE ZONE", CW / 2, 170);
+  const open = true, gl = 0.5 + 0.25 * Math.sin(now / 300);                          // always-open arena door
+  box(CW - 60, DOOR.y0, 60, DOOR.y1 - DOOR.y0, open ? "rgba(255,255,255," + (0.55 + gl * 0.3) + ")" : "rgba(120,120,120,.3)", 12);
+  let fighting = 0; others.forEach(o => { if (o.room === "main" && !o.dead) fighting++; });
+  g.fillStyle = open ? "#fff" : "rgba(255,255,255,.4)"; g.textAlign = "right"; g.font = "bold 22px system-ui"; g.fillText("ARENA ->", CW - 80, DOOR.y0 - 40);
+  g.font = "14px system-ui"; g.fillStyle = "rgba(255,255,255,.6)"; g.fillText(fighting + " players in combat.", CW - 80, DOOR.y0 - 16);
+  g.textAlign = "center";
+}
+function drawLockedDoor() {                                              // where you came in: sealed
+  box(0, RH / 2 - 70, 14, 140, "rgba(255,255,255,.25)", 4);
+  g.fillStyle = "rgba(255,255,255,.35)"; g.font = "12px system-ui"; g.textAlign = "left";
+  g.fillText("-->", 22, RH / 2 + 4); g.textAlign = "center";
+}
+function render(now) {
+  g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+  const shx = shake ? (Math.random() - 0.5) * 2 * shake : 0, shy = shake ? (Math.random() - 0.5) * 2 * shake : 0;
+  g.save(); g.translate(camX0 + shx, camY0 + shy); g.scale(camS, camS);
+  if (me.room === "chill") drawChill(now); else {
+  box(0, 0, RW, RH, "#141414", 24);
+  GUNS.forEach(s => {                               // gun pickups
+    if (!s.up) return;
+    g.strokeStyle = "rgba(255,255,255," + (0.3 + 0.25 * Math.sin(now / 250)) + ")"; g.lineWidth = 2;
+    g.beginPath(); g.arc(s.x, s.y, 26, 0, 7); g.stroke();
+    box(s.x - 12, s.y - 5, 24, 9, "#d0d0d0", 2); box(s.x - 9, s.y + 3, 7, 11, "#9a9a9a", 2); box(s.x + 8, s.y - 3, 9, 5, "#fff", 1);
+  });
+  drawLockedDoor();
+  }
+  puffs.forEach(p => {
+    if (p.rm !== me.room) return;
+    const f = p.life / p.max;
+    g.globalAlpha = Math.max(0, f * 0.4); g.fillStyle = "#ebebeb";
+    g.beginPath(); g.arc(p.x, p.y, p.r + (1 - f) * 10, 0, 7); g.fill();
+  });
+  g.globalAlpha = 1;
+  ghosts.forEach(gh => {
+    if (gh.rm !== me.room) return;                            // dash after-images
+    g.globalAlpha = Math.max(0, gh.life / gh.max) * 0.35; g.fillStyle = gh.c;
+    g.beginPath(); g.arc(gh.x, gh.y, R, 0, 7); g.fill();
+  });
+  g.globalAlpha = 1;
+  if (me.armed && !me.dead) {                       // laser sight
+    const a = lock ? lock.a : me.aim, c = Math.cos(a), s = Math.sin(a), mx = me.x + c * (R + 16), my = me.y + s * (R + 16);
+    const gr = g.createLinearGradient(mx, my, mx + c * 360, my + s * 360);
+    gr.addColorStop(0, "rgba(255,255,255,.4)"); gr.addColorStop(1, "rgba(255,255,255,0)");
+    g.strokeStyle = gr; g.lineWidth = 1.5; g.setLineDash([3, 7]);
+    g.beginPath(); g.moveTo(mx, my); g.lineTo(mx + c * 360, my + s * 360); g.stroke(); g.setLineDash([]);
+  }
+  others.forEach(o => { if (o.room === me.room) who(o, false); });
+  who(me, true);
+  rings.forEach(r => {                              // shockwaves
+    if (r.rm !== me.room) return;
+    const t = 1 - r.life / r.max, e = 1 - (1 - t) * (1 - t);
+    g.globalAlpha = Math.max(0, 1 - t); g.strokeStyle = r.c; g.lineWidth = 8 * (1 - t) + 1;
+    g.beginPath(); g.arc(r.x, r.y, r.r0 + (r.r1 - r.r0) * e, 0, 7); g.stroke();
+  });
+  g.globalAlpha = 1;
+  if (lock) {                                       // lock-on ring + where the shot is leading
+    g.strokeStyle = "#ff6b6b"; g.lineWidth = 2; g.setLineDash([6, 6]); g.lineDashOffset = -now / 40;
+    g.beginPath(); g.arc(lock.o.x, lock.o.y, R + 9, 0, 7); g.stroke(); g.setLineDash([]); g.lineDashOffset = 0;
+    g.fillStyle = "#ff6b6b"; g.beginPath(); g.arc(lock.px, lock.py, 3, 0, 7); g.fill();
+  }
+  if (me.room === "main") bullets.forEach(b => {
+    const sup = b.par || 0;                          // parried bullets: gold, fat, glowing
+    if (sup) { g.fillStyle = "rgba(255,215,90,.22)"; g.beginPath(); g.arc(b.x, b.y, 14 + sup * 3, 0, 7); g.fill(); }
+    g.strokeStyle = b.c; g.lineWidth = sup ? 7 : 3; g.beginPath(); g.moveTo(b.x - b.vx * (sup ? 0.09 : 0.05), b.y - b.vy * (sup ? 0.09 : 0.05)); g.lineTo(b.x, b.y); g.stroke();
+    g.fillStyle = "#fff"; g.beginPath(); g.arc(b.x, b.y, sup ? 6 : 3, 0, 7); g.fill();
+  });
+  parts.forEach(p => {
+    if (p.rm !== me.room) return;
+    g.globalAlpha = Math.max(0, p.life / p.max); g.fillStyle = p.c;
+    g.beginPath(); g.arc(p.x, p.y, p.r, 0, 7); g.fill();
+  });
+  g.globalAlpha = 1;
+  g.textAlign = "center"; g.font = "bold 16px system-ui";
+  if (me.room === "main") floats.forEach(f => { g.font = "bold " + (f.s || 16) + "px system-ui"; g.globalAlpha = Math.max(0, f.life / f.max); g.fillStyle = f.c; g.fillText(f.t, f.x, f.y); });
+  g.globalAlpha = 1;
+  if (me.armed && !me.dead) {                       // crosshair (replaces the system cursor)
+    const r = 9 + (me.kick || 0) * 8;
+    g.strokeStyle = lock ? "#ff6b6b" : "rgba(255,255,255,.85)"; g.lineWidth = 2;
+    g.beginPath(); g.arc(mouse.x, mouse.y, r, 0, 7); g.stroke();
+    g.beginPath();
+    [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach(([ux, uy]) => { g.moveTo(mouse.x + ux * (r + 2), mouse.y + uy * (r + 2)); g.lineTo(mouse.x + ux * (r + 7), mouse.y + uy * (r + 7)); });
+    g.stroke();
+    if (now < hitMarkUntil) {                       // hit marker: little X when your shot lands
+      const t = 1 - (hitMarkUntil - now) / 220, a0 = 6 + t * 6, a1 = 13 + t * 6;
+      g.strokeStyle = "#fff"; g.lineWidth = 3; g.globalAlpha = 1 - t * 0.6; g.beginPath();
+      [[1, 1], [-1, 1], [1, -1], [-1, -1]].forEach(([ux, uy]) => { g.moveTo(mouse.x + ux * a0, mouse.y + uy * a0); g.lineTo(mouse.x + ux * a1, mouse.y + uy * a1); });
+      g.stroke(); g.globalAlpha = 1;
+    }
+  }
+  g.restore();
+  g.textAlign = "center";
+  if (me.dead) {
+    g.fillStyle = "#fff"; g.font = "28px system-ui"; g.fillText("You exploded!", W / 2, H / 2 - 6);
+    g.font = "16px system-ui"; g.fillText("Respawning in " + Math.max(1, Math.ceil((me.respawnAt - now) / 1000)), W / 2, H / 2 + 22);
+  } else if (me.armed && now < hintUntil) {
+    g.fillStyle = "rgba(255,255,255,.8)"; g.font = "14px system-ui";
+    g.fillText("Aim with the mouse. E shoot (hold), F parry, Space/Shift dash. WASD or click to move. Q aim assist, M sound.", W / 2, 70);
+  } else if (me.room === "chill") {
+    g.fillStyle = "rgba(255,255,255,.55)"; g.font = "14px system-ui";
+    g.fillText("Safe Zone — walk through the door to enter the arena.", W / 2, 70);
+  }
+  if (now < toastUntil) {
+    g.globalAlpha = Math.min(1, (toastUntil - now) / 400); g.fillStyle = "#fff"; g.font = "bold 22px system-ui";
+    g.fillText(toastMsg, W / 2, 110); g.globalAlpha = 1;
+  }
+  if (!me.dead) {                                   // dash cooldown bar
+    const r = Math.min(1, (now - lastDash) / DASH_CD);
+    g.fillStyle = "rgba(255,255,255,.15)"; g.fillRect(W / 2 - 40, H - 22, 80, 5);
+    g.fillStyle = r >= 1 ? "#fff" : "rgba(255,255,255,.5)"; g.fillRect(W / 2 - 40, H - 22, 80 * r, 5);
+    const pr = Math.min(1, (now - lastParry) / PARRY_CD);            // parry cooldown bar (gold)
+    g.fillStyle = "rgba(255,215,90,.15)"; g.fillRect(W / 2 - 40, H - 14, 80, 5);
+    g.fillStyle = pr >= 1 ? "#ffd43b" : "rgba(255,215,90,.5)"; g.fillRect(W / 2 - 40, H - 14, 80 * pr, 5);
+  }
+  if (flash > 0.01) { g.fillStyle = "rgba(" + flashCol + "," + Math.min(1, flash) + ")"; g.fillRect(0, 0, W, H); }   // hit-stop flash
+  if (big && now < big.until) {                     // PARRY! pops in huge, then settles and fades
+    const age = now - big.at, pop = age < 120 ? 1.25 - 0.25 * (age / 120) : 1;
+    g.save(); g.translate(W / 2, H * 0.22); g.scale(pop, pop); g.globalAlpha = Math.min(1, (big.until - now) / 250);
+    g.textAlign = "center"; g.lineJoin = "round"; g.lineWidth = 5; g.strokeStyle = "#000";
+    g.font = "bold 30px system-ui"; g.strokeText(big.t, 0, 0); g.fillStyle = "#ffd43b"; g.fillText(big.t, 0, 0);
+    if (big.sub) { g.font = "bold 18px system-ui"; g.strokeText(big.sub, 0, 26); g.fillStyle = "#fff"; g.fillText(big.sub, 0, 26); }
+    g.restore();
+  }
+}
+
+// ---- main loop ----
+let prev = performance.now();
+function tick(t) {
+  const dt = Math.min(0.05, (t - prev) / 1000); prev = t;
+  const now = Date.now();
+  const frozen = now < freezeUntil;                 // hit-stop: the world pauses for a moment...
+  if (frozen) { debt = Math.min(0.3, debt + dt); catchUntil = freezeUntil + 250; }
+  const mdt = frozen ? 0 : dt;                      // (your own movement just pauses)
+  let sdt = mdt;                                    // ...then bullets and smoke fast-forward to catch up
+  if (!frozen && debt > 0) { const x = Math.min(debt, dt * 2); sdt += x; debt -= x; }
+  if (!frozen) flash = flash < 0.02 ? 0 : flash * Math.exp(-9 * dt);
+  if (me.dead && now >= me.respawnAt) respawn();
+  updateCam(dt);
+  mouse.x = (curX - camX0) / camS; mouse.y = (curY - camY0) / camS;     // the camera moves, so re-aim every frame
+  me.aim = Math.atan2(mouse.y - me.y, mouse.x - me.x);
+  lock = assist && me.armed && !me.dead ? assistAim() : null;
+
+  let dx = 0, dy = 0;
+  if (!me.dead) {
+    if (keys.has("arrowleft") || keys.has("a")) dx -= 1;
+    if (keys.has("arrowright") || keys.has("d")) dx += 1;
+    if (keys.has("arrowup") || keys.has("w")) dy -= 1;
+    if (keys.has("arrowdown") || keys.has("s")) dy += 1;
+    if (!dx && !dy && me.tx !== null) {
+      const ex = me.tx - me.x, ey = me.ty - me.y, d = Math.hypot(ex, ey);
+      if (d < 4) me.tx = me.ty = null; else { dx = ex / d; dy = ey / d; }
+    }
+  }
+  if (me.dashT > 0) {                               // dashing: a fixed burst that ignores everything else
+    me.dashT -= mdt;
+    const [mw, mh] = dims(me.room);
+    me.x = num(me.x + me.dashDx * DASH_SPEED * mdt, R, mw - R); me.y = num(me.y + me.dashDy * DASH_SPEED * mdt, R, mh - R);
+    if (now - lastSend > 40) sendPos();
+    if (me.dashT <= 0) { me.dashT = 0; sendPos(); }
+  } else if (dx || dy) {
+    const l = Math.hypot(dx, dy) || 1;
+    const [mw, mh] = dims(me.room);
+    me.x = num(me.x + dx / l * SPEED * mdt, R, mw - R); me.y = num(me.y + dy / l * SPEED * mdt, R, mh - R);
+    if (now - lastSend > 100) sendPos();
+  } else if (me.armed && !me.dead && Math.abs(me.aim - lastAim) > 0.08 && now - lastSend > 120) {
+    sendPos();
+  }
+
+  if (me.room === "chill" && !me.dead && !frozen && me.x > CW - 70 && me.y > DOOR.y0 && me.y < DOOR.y1) enterArena();
+  animate(me, mdt);
+  if (queuedShot) { if (!me.armed || me.dead) queuedShot = false; else if (now - lastShot >= COOLDOWN) fire(); }
+  if (keys.has("e") && me.armed && !me.dead) fire();   // hold E to keep firing
+  me.kick = Math.max(0, (me.kick || 0) - sdt * 7);
+  shake = shake < 0.05 ? 0 : shake * Math.pow(0.0001, sdt);
+  if (me.parryT > 0) me.parryT = Math.max(0, me.parryT - mdt);
+  if (parryBuf && !frozen) { const t0 = parryBuf; parryBuf = 0; if (now - t0 < 250) parry(); }
+  if (parryCombo && now - lastParryHit > 2500) parryCombo = 0;
+
+  // gun pickups
+  GUNS.forEach((s, i) => {
+    if (!s.up && now - s.at > GUN_RESPAWN_MS) s.up = true;
+    if (s.up && me.room === "main" && !me.dead && !me.armed && Math.hypot(me.x - s.x, me.y - s.y) < R + 14) {
+      me.armed = true; s.up = false; s.at = now; hintUntil = now + 7000;
+      sfx("pick");
+      send("grab", { id, s: i });
+      sendPos();
+    }
+  });
+
+  // bullets
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i], px = b.x, py = b.y;
+    b.x += b.vx * sdt; b.y += b.vy * sdt; b.life -= sdt;
+    if (b.life <= 0 || b.x < 0 || b.x > RW || b.y < 0 || b.y > RH) { bullets.splice(i, 1); continue; }
+    if (me.parryT > 0 && b.owner !== id && me.room === "main" && !me.dead && segDist(me.x, me.y, px, py, b.x, b.y) < R + PARRY_R) { doParry(b); continue; }
+    if (b.owner !== id && me.room === "main" && !me.dead && !(me.dashT > 0) && now >= me.shield && segDist(me.x, me.y, px, py, b.x, b.y) < R + 7) {
+      bullets.splice(i, 1);
+      hurt(b);
+    }
+  }
+
+  // smoke puffs
+  for (let i = puffs.length - 1; i >= 0; i--) {
+    const p = puffs[i];
+    p.x += p.vx * sdt; p.y += p.vy * sdt; p.life -= sdt;
+    if (p.life <= 0) puffs.splice(i, 1);
+  }
+
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i]; f.y -= 40 * sdt; f.life -= sdt;
+    if (f.life <= 0) floats.splice(i, 1);
+  }
+
+  for (let i = ghosts.length - 1; i >= 0; i--) { ghosts[i].life -= sdt; if (ghosts[i].life <= 0) ghosts.splice(i, 1); }
+  for (let i = rings.length - 1; i >= 0; i--) { rings[i].life -= sdt; if (rings[i].life <= 0) rings.splice(i, 1); }
+
+  // particles
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.x += p.vx * sdt; p.y += p.vy * sdt;
+    const f = Math.max(0, 1 - 2.2 * sdt); p.vx *= f; p.vy *= f;
+    p.life -= sdt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+
+  others.forEach((o, k) => {
+    if (now - o.seen > 5000) { others.delete(k); return; }
+    if (frozen) return;                              // paused with everyone else; their latest position waits in o.tx / o.ty
+    // after a freeze (or during a dash) pull them to where they really are quickly, so nobody pops or teleports
+    const rate = now < catchUntil || (o.dashUntil && now < o.dashUntil) ? 45 : 18, f = 1 - Math.exp(-rate * dt);
+    o.x += (o.tx - o.x) * f; o.y += (o.ty - o.y) * f;
+    animate(o, dt);
+    o.kick = Math.max(0, (o.kick || 0) - dt * 7);
+  });
+
+  const cur = me.armed && !me.dead ? "none" : "default";
+  if (cv.style.cursor !== cur) cv.style.cursor = cur;
+  render(now); requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
