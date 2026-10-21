@@ -324,7 +324,7 @@ function die(by, par) {
   const o = others.get(by), killer = o && o.name ? o.name : "someone";
   explode(me.x, me.y, me.color);
   shake = 14; sfx("boom"); me.dashT = 0; me.parryT = 0; parryCombo = 0; hitstop(FREEZE_MS, 0.9);
-  addLog("\u2620", name + " was blown up by " + killer, "#aaa");
+  addLog("\u2620", name + " was killed by " + killer, "#aaa");
   send("die", { id, name, color: me.color, x: me.x, y: me.y, by: killer, byId: by, par: par || 0 });
   sendPos();
 }
@@ -379,8 +379,8 @@ room.on("broadcast", { event: "pos" }, ({ payload: p }) => {
   if (o) { o.dead = true; o.hp = 0; o.armed = false; }
   const nm = String(p.name || "?").slice(0, 20), by = String(p.by || "someone").slice(0, 20);
   explode(num(p.x, 0, RW), num(p.y, 0, RH), COLORS.includes(p.color) ? p.color : "#fff");
-  addLog("\u2620", nm + " was blown up by " + by, "#aaa");
-  if (p.byId === id) { if (rs.phase === "play") { me.pts = (me.pts || 0) + 1; sendPos(); } toast("You blew up " + nm + (rs.phase === "play" ? "  +1" : ""), 2500); shake = Math.max(shake, 8); sfx("boom"); sfx("kill"); hitstop(FREEZE_MS, 0.9); if (p.par) { bang("PARRY KILL!", nm); hitstop(130, 0.6, "255,215,90"); } }
+  addLog("\u2620", nm + " was killed by " + by, "#aaa");
+  if (p.byId === id) { if (rs.phase === "play") { me.pts = (me.pts || 0) + 1; sendPos(); } toast("You Died " + nm + (rs.phase === "play" ? "  +1" : ""), 2500); shake = Math.max(shake, 8); sfx("boom"); sfx("kill"); hitstop(FREEZE_MS, 0.9); if (p.par) { bang("PARRY KILL!", nm); hitstop(130, 0.6, "255,215,90"); } }
   else if (me.room === "main") { shake = Math.max(shake, 4); sfx("boom"); hitstop(FREEZE_SOFT_MS, 0.25); }   // the chill room doesn't feel it
 }).on("broadcast", { event: "pw" }, ({ payload: p }) => {
   const o = p && others.get(p.id);
@@ -545,13 +545,13 @@ function drawChill(now) {
   box(CW - 60, DOOR.y0, 60, DOOR.y1 - DOOR.y0, open ? "rgba(255,255,255," + (0.55 + gl * 0.3) + ")" : "rgba(120,120,120,.3)", 12);
   let fighting = 0; others.forEach(o => { if (o.room === "main" && !o.dead) fighting++; });
   g.fillStyle = open ? "#fff" : "rgba(255,255,255,.4)"; g.textAlign = "right"; g.font = "bold 22px system-ui"; g.fillText(open ? "ARENA ->" : "ARENA (closed)", CW - 80, DOOR.y0 - 40);
-  g.font = "14px system-ui"; g.fillStyle = "rgba(255,255,255,.6)"; g.fillText(open ? fighting + " fighting. no way back until you die" : "opens in " + Math.ceil(rs.left / 1000) + "s", CW - 80, DOOR.y0 - 16);
+  g.font = "14px system-ui"; g.fillStyle = "rgba(255,255,255,.6)"; g.fillText(open ? fighting + " players in combat. " : "opens in " + Math.ceil(rs.left / 1000) + "s", CW - 80, DOOR.y0 - 16);
   g.textAlign = "center";
 }
 function drawLockedDoor() {                                              // where you came in: sealed
   box(0, RH / 2 - 70, 14, 140, "rgba(255,255,255,.25)", 4);
   g.fillStyle = "rgba(255,255,255,.35)"; g.font = "12px system-ui"; g.textAlign = "left";
-  g.fillText("safe zone: locked until you die", 22, RH / 2 + 4); g.textAlign = "center";
+  g.fillText("-->", 22, RH / 2 + 4); g.textAlign = "center";
 }
 function drawRoundHud(now) {
   const play = rs.phase === "play", sec = Math.ceil(rs.left / 1000);
@@ -663,7 +663,7 @@ function render(now) {
     g.fillText("Aim with the mouse. E shoot (hold), F parry, Space/Shift dash. WASD or click to move. Q aim assist, M sound.", W / 2, 70);
   } else if (me.room === "chill") {
     g.fillStyle = "rgba(255,255,255,.55)"; g.font = "14px system-ui";
-    g.fillText(rs.phase === "play" ? "Safe zone: no guns in here. The glowing door on the right leads to the arena. No coming back until you die." : "Intermission: the arena opens when the timer hits 0. 1 point per kill.", W / 2, 70);
+    g.fillText(rs.phase === "play" ? "Safe Zone" : "Intermission: the arena opens when the timer hits 0. 1 point per kill.", W / 2, 70);
   }
   if (now < toastUntil) {
     g.globalAlpha = Math.min(1, (toastUntil - now) / 400); g.fillStyle = "#fff"; g.font = "bold 22px system-ui";
